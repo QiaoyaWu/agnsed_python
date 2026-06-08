@@ -2,26 +2,18 @@
 
 import os,sys,time
 import numpy as np
-from astropy.io import fits
-import matplotlib.pyplot as plt
 import warnings
 import pandas as pd
 warnings.filterwarnings("ignore")
-from astropy.table import Table
-import matplotlib as mpl
 from astropy import units as u
 from astropy import constants as const
 from astropy.modeling.models import BlackBody
-from multiprocessing import Pool
-from scipy.signal import medfilt
-from scipy import stats
 from scipy import integrate
 from scipy import interpolate
 import scipy.optimize as opt
-from functools import partial
 from scipy.interpolate import UnivariateSpline
-from numba import njit
 import pickle
+import numba
 
 class agnsed:
     def __init__(self, 
@@ -39,7 +31,7 @@ class agnsed:
         r_hot=-1,
         r_warm=-1,
         logr_out=-1,
-        hmax_hot=1e16,
+        hmax_hot=100,
         method = 'KD18',
         solv_slim_args = None,
         if_reprocessing = True,
@@ -190,9 +182,9 @@ class agnsed:
                 
         if if_qsosed:
             self.hmax_hot = min(100.0, self.r_hot)
-        #if self.method == 'KD19': #(self.if_slimdisk == True):
-        #    self.L_corona_seed = self._compute_L_corona_seed(self.r_in, self.r_sg) 
-        #else:
+        else:
+            self.hmax_hot = hmax_hot
+        
         self.L_corona_seed = self._compute_L_corona_seed(self.r_hot, self.r_sg)  
 
         if if_qsosed:
@@ -689,307 +681,6 @@ class agnsed:
         else:
             return None
     
-    def _compute_slimdisk_equation_rho_Tc(self, args):
-        if self.method != 'Slim':
-            return None
-        if self.verbose:
-            print(f'Computing slim disk structure from  1e4 Rs inwards')
-
-        Rs = (self.Rg * 2).cgs.value
-        r_grid = np.geomspace(10000, 1.01, 1000)
-        l_in = args['lin']*Rs*const.c.cgs.value #(3/2.)**(3/2.)*Rg*const.c
-        l_in_range = np.zeros(2)
-        d_lin = args['d_lin']
-        mu = 0.617
-        G = const.G.cgs.value
-        c = const.c.cgs.value
-        alpha = 0.1
-        MBH = self.MBH.cgs.value
-        Mdot = self.Mdot.cgs.value
-        mdot_crit = self.mdot_crit.cgs.value
-        sigma_sb = const.sigma_sb.cgs.value
-        const1 = (const.k_B / (mu * const.m_p)).cgs.value
-        const2 = (4 * const.sigma_sb / (3 * const.c)).cgs.value
-
-        N = 3
-        I_N = 16./35.
-        I_Np1 = 128./315.
-
-        def compute_quantities_Tc_rho(R, Tc, rho, l_in):
-            OmegaK = np.sqrt(G * MBH / R**3) / (1 - Rs/R)
-            l_K = OmegaK * R**2
-            
-            p_gas = const1 * rho * Tc
-            p_rad = const2 * Tc**4
-            pressure = p_rad + p_gas
-            beta = p_gas / pressure
-
-            height = np.sqrt(2*(N+1) * pressure / rho) / OmegaK
-            Sigma = 2 * I_N * height * rho
-            Pi = 2 * I_Np1 * height * pressure
-            vr = - Mdot / (2 * np.pi * R * Sigma)
-
-            l = l_in + 2 * np.pi * R**2 * alpha * Pi / Mdot
-            Omega = l / R**2
-
-            #kappa_ff = 6.5e22 * (I_N*rho.cgs.value) * ((2/3.*Tc)**(-3.5)).cgs.value # cm^2/g
-            kappa_ff = 6.4e22 * rho * Tc**(-3.5) # cm^2/g
-            tau = (0.34  + kappa_ff) * rho * height
-            Q_rad = 32/3. * sigma_sb * Tc**4 / tau
-
-            return pressure, beta, \
-                    height, Sigma, Pi, \
-                    vr, l, l_K, Omega, OmegaK, \
-                    Q_rad
-
-        def each_step_Tc_rho(y, r, Rs, l_in):
-            Tc, rho = y
-            R = r * Rs
-
-            pressure, beta, height, Sigma, Pi, vr, l, l_K, Omega, OmegaK, Q_rad = compute_quantities_Tc_rho(R, Tc, rho, l_in)
-            cs = np.sqrt(pressure/rho)
-            if False:
-                print(f'r={r}, Tc={Tc}, rho={rho}, H/R={height/R}')
-                print(f'vr/c={vr/3e5}, Omega/OmegaK={Omega/OmegaK}')
-
-            dlnOmegaK_dr = - (3*R-Rs)/(2*R*(R-Rs))
-            dP_dT = const1 * rho + 4*const2*Tc**3
-            dP_drho = const1 * Tc 
-
-            #print('coefficients of the first equations:')
-            A_T = dP_dT * ((3*I_Np1)/(2*I_N*rho) - vr**2/(2*pressure))
-            A_rho = dP_drho * ((3*I_Np1)/(2*I_N*rho) - vr**2/(2*pressure)) - vr**2/(2*rho) - I_Np1/I_N * pressure/(2*rho**2)
-            A_const = (Omega**2 - OmegaK**2)*R + vr**2 * (1/R - dlnOmegaK_dr)
-
-            #print('coefficients of the second equations:')
-            B_T =  - Pi*alpha/R * (3*l)/(2*pressure) * dP_dT \
-            + 9/(16*np.pi*R) * Mdot * pressure/(Tc*rho) * (12-10.5*beta) 
-            B_rho = - Pi*alpha/R * l * (3/(2*pressure)*dP_drho - 1/(2*rho)) \
-            - 9/(16*np.pi*R) * Mdot * pressure/rho**2 * (4-3*beta) 
-            B_const = Q_rad - Pi*alpha*l/R * dlnOmegaK_dr
-
-            D = A_T*B_rho - A_rho*B_T
-            N = A_const*B_rho - A_rho*B_const
-            dTdR = N/D
-            drhodR = (A_T*B_const - A_const*B_T)/D
-            dTdr, drhodr = dTdR*Rs, drhodR*Rs
-            return N, D, vr, cs, dTdr, drhodr
-        def derivaties(y, r, Rs, l_in):
-            N, D, vr, cs, dTdr, drhodr = each_step_Tc_rho(y, r, Rs, l_in)
-            return [dTdr, drhodr]
-
-        def event_sonic(r, y, Rs, l_in):
-            N, D, vr, cs, dTdr, drhodr = each_step_Tc_rho(y, r, Rs, l_in)
-            return D
-
-        rho_out, Tc_out = self._compute_SSD_rho_Tc(r_grid[0]*Rs, Rs)
-        rho_out, Tc_out = rho_out.value, Tc_out.value
-
-        flag_transonic = False
-        time0 = time.time()
-        while not flag_transonic:
-            if (l_in < 1.0*Rs*c) or (time.time() - time0 > 900):
-                raise RuntimeError("Failed to solve the slim disk ODEs. ")
-            else:
-                if np.all(l_in_range != 0):
-                    l_in = np.mean(l_in_range)
-            if self.verbose:
-                print(f'Trying to solve the slim disk with l_in={l_in/Rs/c} Rs*c ...')
-
-            event = partial(event_sonic, Rs=Rs, l_in=l_in)
-            event.terminal = True
-            event.direction = 0
-
-            y_arr = integrate.solve_ivp(fun=lambda r,y: derivaties(y, r, Rs, l_in), \
-                t_span=[r_grid[0], r_grid[-1]], y0=[Tc_out, rho_out], \
-                #t_eval=r_grid, 
-                method='RK45', 
-                #max_step=args['max_step'], 
-                rtol=args['rtol'], atol=args['atol'],
-                events=[event], dense_output=True
-                )
-            
-            ind_argmin = np.nanargmin(y_arr.t)
-            quantities_tmp = compute_quantities_Tc_rho(y_arr.t.min()*Rs, y_arr.y[0][ind_argmin], y_arr.y[1][ind_argmin], l_in)
-            cs = np.sqrt(quantities_tmp[0]/y_arr.y[1][ind_argmin])
-            vr = abs(quantities_tmp[5])
-            if self.verbose:
-                print('ODE inner bound: r_min=', y_arr.t.min(), '|vr|/cs = ', abs(vr/cs))
-                print(y_arr.message)
-            if y_arr.t.min() > 3.0:
-                l_in_range[1] = l_in
-                l_in = l_in - d_lin*Rs*c
-            #elif abs(vr/cs) < 1.0:
-            #    l_in = l_in + d_lin*Rs*c
-            else:
-                self.slim_lin = l_in
-                flag_transonic = True
-                print(f'Solution found with l_in={l_in/Rs/c} Rs*c')
-
-        if len(y_arr.t_events[0]) > 0:
-            # compute the left side of the sonic point
-            dr = 1e-8
-            r0_crit = y_arr.t_events[0][0]
-            r0_left = r0_crit - dr
-            y0_crit = y_arr.y_events[0][0]
-            dTdr, drhodr = each_step_Tc_rho(y0_crit, r0_left, Rs, l_in)[4:]
-            y0_left = [y0_crit[0] + dTdr*dr, y0_crit[1] + drhodr*dr]
-
-            y_arr_left = integrate.solve_ivp(fun=lambda r,y: derivaties(y, r, Rs, l_in), \
-                                                t_span=[r0_left, r_grid[-1]], 
-                                                y0=y0_left, 
-                                                method='RK45',
-                                                rtol=args['rtol'], atol=args['atol'],
-                                                dense_output=True)
-            full_r_arr = np.concatenate((y_arr.t, y_arr_left.t[1:]))
-            full_y_arr = np.concatenate((y_arr.y, y_arr_left.y[:, 1:]), axis=1)
-        else:
-            full_r_arr = y_arr.t
-            full_y_arr = y_arr.y
-            
-        quantities = np.zeros((len(full_r_arr), 10))
-        # Tc, rho, P, beta, H, vr, Omega, OmegaK, Q_rad
-        self.r_in_slim = y_arr.t.min()*2
-        for i in range(len(full_r_arr)):
-            P, beta, H, Sigma, Pi, vr, l, l_K, Omega, OmegaK, Q_rad = compute_quantities_Tc_rho(full_r_arr[i]*Rs, full_y_arr[0][i], full_y_arr[1][i], l_in)
-            quantities[-i-1] = [full_r_arr[i]*Rs, full_y_arr[0][i], full_y_arr[1][i], \
-                            P, beta, H, vr, Omega, OmegaK, Q_rad]
-        if self.verbose:
-            print(f'Slim disk solution computed from r={r_grid[0]} to r={r_grid[-1]} (Rs) successfully.')
-            print(f'Slim disk quantities: radius (cm), Tc (K), rho (g/cm^3), P (dyne/cm2), beta, H (cm), vr (cm/s), Omega (1/s), OmegaK (1/s), Q_rad (g/s^3)')
-        quantities = pd.DataFrame(quantities, columns=['R', 'Tc', 'rho', 'P', 'beta', 'H', 'vr', 'Omega', 'OmegaK', 'Q_rad'])
-        return quantities
-
-    def _compute_slimdisk_equation_l_mach2(self, args):
-        if self.method != 'Slim':
-            return None
-        if self.verbose:
-            print(f'Computing slim disk structure from  1e4 Rs inwards')
-        
-        l_in = args['lin']
-        l_in_range = [args['lin']-0.15, args['lin']+0.15]
-        mu = 0.617
-        kes = 0.34
-        G = const.G.cgs.value
-        c = const.c.cgs.value
-        alpha = 0.1
-        sigma_sb = const.sigma_sb.cgs.value
-        const1 = (const.k_B / (mu * const.m_p)).cgs.value
-        const2 = (4 * const.sigma_sb / (3 * const.c)).cgs.value
-
-        Rs = (self.Rg * 2).cgs.value
-        MBH = self.MBH.cgs.value
-        Mdot = self.Mdot.cgs.value
-        mdot_crit = self.mdot_crit.cgs.value
-        
-        N = 3
-        I_N = 16./35.
-        I_Np1 = 128./315.
-        
-        def get_Tc(T, a, b, c):
-            return a * T**4 + b * T + c
-
-        def compute_quantities_l_mach2(r, l, mach2, Rs, l_in):
-            # mach2 = vr^2 / (Pi/Sigma)
-            Omega_K = ((G * MBH / r / Rs) ** (1 / 2)) / (r - 1) / Rs
-            lk = Omega_K * ((r * Rs) ** 2) / Rs / c
-            Pi = Mdot * c * Rs * (l - l_in) / 2 / np.pi / alpha / ((r * Rs) ** 2)
-            Sigma = ((Mdot) ** 2) / ((2 * np.pi * r * Rs) ** 2) / Pi / mach2
-            vr = -Mdot / 2 / np.pi / r / Rs / Sigma
-            Pi_Sigma = Pi / Sigma
-            H = ((2 * (N + 1) * Pi * I_N / Sigma / I_Np1) ** (1 / 2)) / Omega_K
-            P = Pi / 2 / H / I_Np1
-            rho = Sigma / 2 / H / I_N
-            cs = (P / rho) ** (1 / 2)
-            Tc = float(opt.fsolve(get_Tc, 3e5, (const2, const1*rho, -P)))
-
-            kabs = 6.4e22 * rho * Tc ** (-3.5)
-            kk = kabs + kes
-            Qrad = (8 * const2 * c * Tc ** 4) / (kk * rho * H)
-            beta = const1 * rho * Tc / P
-            T1 = (32 - 24 * beta - 3 * beta ** 2) / (24 - 21 * beta)
-            T3 = (32 - 27 * beta) / (24 - 21 * beta)
-            return Omega_K, lk, Pi, Sigma, vr, Pi_Sigma, \
-                H, P, rho, cs, Tc, beta, T1, T3, Qrad
-
-        def each_step_l_mach2(l, mach2, r, Rs, l_in):
-
-            Omega_K, lk, Pi, Sigma, vr, Pi_Sigma, \
-                H, P, rho, cs, Tc, bmach2, T1, T3, Qrad = compute_quantities_l_mach2(r, l, mach2, Rs, l_in)
-            
-            dlnOmegaK_dr = - (3*r-1)/(2*r*Rs*(r-1))
-            #- (3*R-Rs)/(2*R*(R-Rs))
-            
-            D = Mdot * T1 / ((Rs * r) ** 2) / np.pi / alpha / Pi / (T3 - 1) \
-                - 2 * np.pi * alpha * Pi / Pi_Sigma / Mdot \
-                - ((1 + mach2) * Mdot / ((r * Rs) ** 2) / 2 / np.pi / alpha / Pi * (3 * T1 - 1) / 2 / mach2 / (T3 - 1))
-            dl_dr = (1 / c) * ((T1 + 1) / (T3 - 1) / r / Rs + (T1 - 1) / (T3 - 1) * dlnOmegaK_dr \
-                                + 4 * np.pi * r * Rs * Qrad / Pi_Sigma / Mdot - 4 * np.pi * alpha * Pi * l * c / Pi_Sigma / Mdot / r \
-                                - (3 * T1 - 1) / (2 * mach2 * (T3 - 1)) * (((l ** 2 - lk ** 2) * c ** 2 / r ** 3 / Pi_Sigma / Rs) \
-                                                                        - mach2 / r / Rs - dlnOmegaK_dr + 2 / r / Rs * (1 + mach2))) / D
-
-            dmach2_dr = Rs * ((((l ** 2 - lk ** 2) * c ** 2 / r ** 3 / Pi_Sigma / Rs) - mach2 / r / Rs \
-                            - dlnOmegaK_dr + 2 / r / Rs * ( 1 + mach2)) - c * ( 1 + mach2) * Mdot / 2 / np.pi / alpha / Pi / ((r * Rs) ** 2) * \
-                            (dl_dr))
-            return dl_dr, dmach2_dr
-
-        r_grid = np.geomspace(10000, 3, 1000)
-        # initial value at the outer boundary
-        R0=r_grid[0]*Rs
-        Omega0 = np.sqrt(G * MBH / R0**3) / (1 - Rs/R0)
-        l0 = Omega0 * R0**2 / (Rs * c)
-        vr0 = -5.4e5*alpha**(4/5.) * (mdot_crit)**(3/10.) * (MBH/const.M_sun.cgs.value)**(-1/5.) \
-                    * (R0/Rs)**(-1/4.)
-        Sigma0 = - Mdot / (2 * np.pi * R0 * vr0)
-        Pi0 = Mdot * (l0 - l_in) * Rs * c / (2 * np.pi * alpha * R0**2)
-        mach20 = vr0**2 / (Pi0/Sigma0)
-
-        # solve the ODEs
-        flag_transonic = False
-        time0 = time.time()
-        while not flag_transonic:
-            if (time.time() - time0 > 600):
-                raise RuntimeError("Failed to solve the slim disk ODEs. ")
-            l_in = np.mean(l_in_range)
-            if self.verbose:
-                print(f'Trying to solve the slim disk with l_in={l_in} ...')
-            y_arr = integrate.solve_ivp(fun=lambda r,y: each_step_l_mach2(y[0], y[1], r, Rs, l_in), \
-                                t_span=[r_grid[0], r_grid[-1]], \
-                                y0=[l0, mach20], \
-                                method='RK45', t_eval=r_grid, \
-                                max_step=args['max_step'], rtol=args['rtol'], atol=args['atol'])
-            idx = np.argmin(y_arr.t)
-            quantities_tmp = compute_quantities_l_mach2(y_arr.t[idx], y_arr.y[0][idx], y_arr.y[1][idx], Rs, l_in)
-            cs = quantities_tmp[9]
-            vr = abs(quantities_tmp[4])
-            if self.verbose:
-                print('ODE inner bound: r_min=', y_arr.t[idx], '|vr|/cs = ', abs(vr/cs))
-            if y_arr.t[idx] > 3.:
-                l_in_range[1] = l_in
-            #elif abs(vr/cs) < 1:
-            #    l_in_range[0] = l_in
-            else:
-                flag_transonic = True
-                if self.verbose:
-                    print('Found transonic solution at l_in = ', l_in)
-        
-        self.slim_lin = l_in
-        quantities = np.zeros((len(y_arr.t), 14))
-        # r, l, mach2, lk, Pi, Sigma, vr, H, P, rho, cs, Tc, beta, Qrad
-        self.r_in_slim = y_arr.t.min()*2
-        for i in range(len(y_arr.t)):
-            ii = - i - 1
-            r, l, mach2 = y_arr.t[i], y_arr.y[0][i], y_arr.y[1][i]
-            Omega_K, lk, Pi, Sigma, vr, Pi_Sigma, \
-                H, P, rho, cs, Tc, beta, T1, T3, Qrad = compute_quantities_l_mach2(r, l, mach2, Rs, l_in)
-            quantities[ii, :] = r*Rs, l*c*Rs, mach2, lk*c*Rs, Pi, Sigma, vr, H, P, rho, cs, Tc, beta, Qrad
-        quantities = pd.DataFrame(quantities, columns=['R', 'l', 'mach2', 'lk', 'Pi', 'Sigma', 'vr', \
-                                                        'H', 'P', 'rho', 'cs', 'Tc', 'beta', 'Q_rad'])
-        if self.verbose:
-            print(f'Slim disk solution computed from r={r_grid[0]} to r={r_grid[-1]} (Rs) successfully.')
-            print(f'Slim disk quantities: radius (cm), l, mach2, lk, Pi (dyne/cm), Sigma (g/cm^2), vr (cm/s), H (cm), P (dyne/cm^2), rho (g/cm^3), cs (cm/s), Tc (K), beta, Q_rad (g/s^3)')
-        return quantities
-
     def _compute_slimdisk_equation_WSig(self):
         # define the constants and convert physical qunatities to unitless to speed up the computations
         mu_p = 0.617
@@ -1042,19 +733,6 @@ class agnsed:
             height = np.sqrt(pressure / rho)/OmgK / (c/np.sqrt(G*MBH))
             Sigma = 2 * height * rho / (Mdot_edd/c/Rg**2)
             Wtp = 2 * height * pressure / (Mdot_edd*c/Rg**2)
-            return Sigma, T, Wtp
-
-        def _compute_SSD_quant_N3(r, Rg):
-            OmgK = np.sqrt(G*MBH/r)/(r-2.)
-            rho = 4.7e1 * alpha**(-7/10.) * (MBH)**(-7/10.) * (10*mdot)**(11/20.) * (r/2)**(-15/8.) 
-            T = 6.9e7 * alpha**(-1/5.) * (MBH)**(-1/5.) * (10*mdot)**(3/10.) * (r/2)**(-3/4.)
-            p_gas = const1 * rho * T
-            p_rad = const2 * T**4
-            pressure = p_rad + p_gas
-            beta = p_gas / pressure
-            height = np.sqrt(2*(N+1) * pressure / rho)/OmgK / (c/np.sqrt(G*MBH))
-            Sigma = 2 * I_N * height * rho / (Mdot_edd/c/Rg**2)
-            Wtp = 2 * I_Np1 * height * pressure / (Mdot_edd*c/Rg**2)
             return Sigma, T, Wtp
 
         def _compute_quantities_N3(r, Wtp, Sigma, ellin, Rg):
@@ -1487,7 +1165,7 @@ class agnsed:
         
         return fcol_d
 
-    def _disk_blackbody_emisison_r(self, radius):
+    def _disk_blackbody_emission_r(self, radius):
         Temp = self._compute_disk_temperature4(radius) ** (1/4.) # no unit, unit: K
         
         if self.fcol_corr <= 0:
@@ -1520,7 +1198,7 @@ class agnsed:
             drbin = rbin_out - rbin_in
             rbin_cent = (rbin_out + rbin_in) / 2.
             
-            flux_at_r = self._disk_blackbody_emisison_r(rbin_cent) # unit: erg/(cm^2 s Hz)
+            flux_at_r = self._disk_blackbody_emission_r(rbin_cent) # unit: erg/(cm^2 s Hz)
             flux_annular_r = 2 * np.pi * (2 * np.pi * self.Rg**2 * rbin_cent * drbin * flux_at_r).to(u.erg / u.s / u.Hz).value # unit: erg/s/Hz
             flux_annular_r[~np.isfinite(flux_annular_r)] = 0 # set inf or nan to zero
             total_disk_flux += flux_annular_r
@@ -1581,7 +1259,7 @@ class agnsed:
     
     def _warm_compton_emission_total(self, logr_in, logr_out):
         total_warm_flux = np.zeros(len(self.nu_arr))
-        r_grid = np.geomspace(logr_in, logr_out, num=100)
+        r_grid = np.linspace(logr_in, logr_out, num=100)
         self.warm_logr_grid = r_grid.copy()
 
         for i in range(len(r_grid) - 1):
@@ -1655,7 +1333,7 @@ class agnsed:
 
     def _hot_compton_emission_total(self, logr_in, logr_out):
         total_hot_flux = np.zeros(len(self.nu_arr))
-        r_grid = np.geomspace(logr_in, logr_out, num=100)
+        r_grid = np.linspace(logr_in, logr_out, num=100)
         self.hot_logr_grid = r_grid.copy()
 
         for i in range(len(r_grid) - 1):
@@ -1667,14 +1345,6 @@ class agnsed:
             flux_at_r = self._hot_compton_emission_r(rbin_cent)
             flux_at_r[~np.isfinite(flux_at_r)] = 0
             
-            """if self.if_slimdisk == True:
-                # scale the compton flux to the disk flux at r
-                flux_at_r_int = integrate.trapezoid(flux_at_r, self.nu_arr) # integrate
-                disk_flux_at_r = const.sigma_sb * self._compute_disk_temperature4(rbin_cent, True) * u.K**4 # erg/s/cm^2
-                ratio = (disk_flux_at_r / flux_at_r_int).cgs # ratio of disk flux to compton flux at rbin_cent
-                hc_flux_at_r = flux_at_r * ratio # scale the compton flux to the disk flux
-            else:
-                hc_flux_at_r = flux_at_r"""
             hc_flux_at_r = flux_at_r
 
             flux_annular_r = 2 * (2 * np.pi * self.Rg**2 * rbin_cent * drbin * hc_flux_at_r).to(u.erg / u.s / u.Hz).value
@@ -1694,11 +1364,7 @@ class agnsed:
             self.SED_hot_component = op_hot_compton_component
             if self.verbose: print("No hot corona region, return zero spectrum and luminosity")
             return op_hot_compton_component
-        
-        """if self.if_slimdisk == True:
-            hot_compton_spectrum = self._hot_compton_emission_total(logr_in, logr_out)
-            hot_compton_luminosity = self.L_corona_dissipated # hot corona is disk-like in slim disk
-            else:"""       
+               
         hot_compton_spectrum_tmp = self._hot_compton_emission_total(logr_in, logr_out)
         hot_compton_spectrum_integrated = integrate.trapezoid(hot_compton_spectrum_tmp.value, self.nu_arr.value) 
         hot_compton_luminosity = self._hot_compton_luminosity() # hot corona is spherical (lampost model) in SSD
@@ -1717,4 +1383,10 @@ class agnsed:
                     self.get_warm_component_intrinsic()['Fnu_warm'] + \
                     self.get_hot_component_intrinsic()['Fnu_hot']
         self.SED_total = Fnu_total
+        return Fnu_total
+    
+    def get_total_SED_obs(self):
+        Fnu_total = (self.get_disk_component_intrinsic()['Fnu_disk'] + \
+                        self.get_warm_component_intrinsic()['Fnu_warm'] + \
+                        self.get_hot_component_intrinsic()['Fnu_hot']) * self.cosi
         return Fnu_total
