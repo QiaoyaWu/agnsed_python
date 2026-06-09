@@ -13,7 +13,7 @@ from scipy import interpolate
 import scipy.optimize as opt
 from scipy.interpolate import UnivariateSpline
 import pickle
-import numba
+from numba import njit
 
 class agnsed:
     def __init__(self, 
