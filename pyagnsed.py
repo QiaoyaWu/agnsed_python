@@ -183,7 +183,11 @@ class agnsed:
         if if_qsosed:
             self.hmax_hot = min(100.0, self.r_hot)
         else:
-            self.hmax_hot = hmax_hot
+            if hmax_hot > self.r_hot:
+                if verbose: print(f"Hot corona height must be smaller than the hot corona radius. set: hmax_hot = {hmax_hot}, r_hot = {self.r_hot}")
+                self.hmax_hot = self.r_hot
+            else:
+                self.hmax_hot = hmax_hot
         
         self.L_corona_seed = self._compute_L_corona_seed(self.r_hot, self.r_sg)  
 
@@ -209,13 +213,12 @@ class agnsed:
             self.kT_warm = kT_warm
             self.Gamma_hot = Gamma_hot
             self.Gamma_warm = Gamma_warm
-            self.hmax_hot = hmax_hot
         
         if self.verbose:
             print(f"r_hot = {self.r_hot}, r_warm = {self.r_warm}")
             print(f"kT_hot = {self.kT_hot}, kT_warm = {self.kT_warm}")
             print(f"Gamma_hot = {self.Gamma_hot}, Gamma_warm = {self.Gamma_warm}")
-            
+            print(f"hmax_hot = {self.hmax_hot}")
     """
     Funtions for accretion paramaters, comptonization from xspec
     """
